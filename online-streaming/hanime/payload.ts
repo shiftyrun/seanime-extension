@@ -405,13 +405,11 @@ function parseHits(hits: string): SearchResult[] {
 // ---------- Main Class ----------
 class Provider {
     private readonly SEARCH_URL = "https://search.htv-services.com";
-    private readonly EPISODE_URL = "https://h.freeanimehentai.net/api/v8/video?id=";
     private readonly API = "https://hanime.tv";
     private readonly REFERER_API = "https://player.hanime.tv";
 
     getSettings(): Settings {
         return {
-            // idk if there's other ones so...
             episodeServers: ["Shiva"],
             supportsDub: false,
         };
@@ -443,6 +441,24 @@ class Provider {
         }>;
     }
 
+    /**
+     * Fetches the hanime.tv video page for a given slug and parses the embedded
+     * __NUXT__ state. This is the single source of truth for both episode lists
+     * and stream manifests, bypassing unreliable third-party mirrors entirely.
+     */
+    private async fetchVideoPageData(slug: string): Promise<Video> {
+        const req = await fetch(`${this.API}/videos/hentai/${slug}`, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": this.API,
+            },
+        });
+        const html = await req.text();
+        const nuxtScript = html.split('window.__NUXT__=')[1].split(';</script>')[0];
+        const json = eval(`(${nuxtScript})`) as HanimeResponse;
+        return json.state.data.video;
+    }
+
     async search(opts: SearchOptions): Promise<SearchResult[]> {
         let page = 1;
         let query = replaceAndWithAmpersand(opts.query.trim());
@@ -462,10 +478,6 @@ class Provider {
             results.push(...parseHits(data.hits));
         }
 
-        // if (results.length > 0) {
-        //     console.log(`Best match for "${opts.query}":\n> ${results.map(r => r.title).join("\n> ")}`);
-        // }
-
         results.forEach(result => {
             result.id = result.url;
             result.url = `${this.API}/videos/hentai/${result.url}`.replace(/-\d+$/, "");
@@ -477,19 +489,15 @@ class Provider {
 
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
         const episodes: EpisodeDetails[] = [];
-        const req = await fetch(`${this.API}/videos/hentai/${id}`);
-        const html = await req.text();
-        
-        const nuxtScript = html.split('window.__NUXT__=')[1].split(';</script>')[0];
-        
-        const json = eval(`(${nuxtScript})`) as HanimeResponse;
-        
-        const videoData = json.state.data.video;
-        videoData.hentai_franchise_hentai_videos.forEach((video) => {
+        const videoData = await this.fetchVideoPageData(id);
+
+        videoData.hentai_franchise_hentai_videos.forEach((video, index) => {
             episodes.push({
-                id: video.id.toString(),
-                number: videoData.hentai_franchise_hentai_videos.indexOf(video) + 1,
-                url: `${this.EPISODE_URL}${video.slug}`,
+                // Store the slug as the episode id so findEpisodeServer can
+                // fetch a fresh manifest on demand without hitting a third-party mirror
+                id: video.slug,
+                number: index + 1,
+                url: `${this.API}/videos/hentai/${video.slug}`,
                 title: videoData.hentai_franchise.name,
             });
         });
@@ -499,32 +507,55 @@ class Provider {
     async findEpisodeServer(episode: EpisodeDetails, _server: string): Promise<EpisodeServer> {
         if (!_server) return {} as EpisodeServer;
 
-        const req = await fetch(episode.url);
+        // Fetch a fresh manifest directly from hanime.tv using the slug in episode.id.
+        const videoData = await this.fetchVideoPageData(episode.id);
+        const manifest = videoData.videos_manifest;
 
-        const result = await req.json();
-        if (!result?.videos_manifest) {
-            // console.log(`No videos manifest for ${episode.title}`);
+        if (!manifest) {
             return <EpisodeServer>{};
         }
-        const videos: VideoSource[] = [];
-        result.videos_manifest.servers.forEach((serverElement: any) => {
-            if (_server !== serverElement.name) return;
 
-            const allowedStreams = serverElement.streams.filter((s: any) => s.is_guest_allowed);
-            allowedStreams.forEach((stream: any) => {
+        console.log("[HANIME DEBUG] manifest servers:", JSON.stringify(manifest.servers.map(s => ({
+            name: s.name,
+            streams: s.streams.map(st => ({
+                height: st.height,
+                extension: st.extension,
+                mime_type: st.mime_type,
+                url: st.url,
+                is_guest_allowed: st.is_guest_allowed,
+            }))
+        }))));
+
+        const videos: VideoSource[] = [];
+
+        for (const serverElement of manifest.servers) {
+            if (_server !== serverElement.name) continue;
+
+            const allowedStreams = serverElement.streams.filter((s) => s.is_guest_allowed);
+
+            // Prefer mp4 streams — they are direct file URLs that don't require HLS
+            // proxying through the app, avoiding the 500 errors from streamable.cloud
+            // rejecting HLS manifest requests that lack proper browser-side cookies/origin.
+            const mp4Streams = allowedStreams.filter((s) => s.extension === "mp4" || s.mime_type === "video/mp4");
+            const streamsToUse = mp4Streams.length > 0 ? mp4Streams : allowedStreams;
+
+            for (const stream of streamsToUse) {
+                const isMp4 = stream.extension === "mp4" || stream.mime_type === "video/mp4";
                 videos.push({
                     url: stream.url,
-                    type: "m3u8" as VideoSourceType,
+                    type: (isMp4 ? "mp4" : "m3u8") as VideoSourceType,
                     quality: `${stream.height}p`,
                     subtitles: [],
                 });
-            });
-        });
+            }
+        }
 
         return <EpisodeServer>{
             server: _server,
             headers: {
-                Referer: `${this.REFERER_API}`,
+                "Referer": this.REFERER_API,
+                "Origin": "https://hanime.tv",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },
             videoSources: videos,
         };
